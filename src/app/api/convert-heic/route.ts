@@ -84,6 +84,7 @@ export async function POST(req: Request) {
         'Content-Type': 'image/jpeg',
         'Content-Disposition': `attachment; filename="${filename}"`,
         'Cache-Control': 'no-store',
+        'Content-Length': outputBuffer.length.toString(),
       },
     });
   } catch (err: unknown) {
