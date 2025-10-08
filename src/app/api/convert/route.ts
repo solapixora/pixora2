@@ -312,7 +312,7 @@ export async function POST(req: Request) {
     const filename = `${baseName}_pixora-ready_${scaleTag}_${targetFps}fps_${targetVideoKbps}k_${usedPath}.mp4`;
 
     const info = `path=${usedPath}; scale=${scaleTag}; fps=${targetFps}; vkbps=${targetVideoKbps}; hasAudio=${hasAudio}`;
-    return new NextResponse(outputBuffer, {
+    return new NextResponse(outputBuffer as any, {
       status: 200,
       headers: {
         'Content-Type': 'video/mp4',

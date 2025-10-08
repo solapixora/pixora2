@@ -78,7 +78,7 @@ export async function POST(req: Request) {
 
     const filename = originalName.replace(/\.(heic|heif)$/i, '') + '_pixora-heic2jpg.jpg';
 
-    return new NextResponse(outputBuffer, {
+    return new NextResponse(outputBuffer as any, {
       status: 200,
       headers: {
         'Content-Type': 'image/jpeg',

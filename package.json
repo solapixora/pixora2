@@ -14,13 +14,14 @@
     "critters": "^0.0.25",
     "fluent-ffmpeg": "^2.1.3",
     "framer-motion": "^12.23.22",
+    "heic-convert": "^2.1.0",
+    "heic-decode": "*",
     "heic2any": "^0.0.4",
     "lucide-react": "^0.544.0",
     "next": "15.5.4",
     "react": "19.1.0",
     "react-dom": "19.1.0",
-    "sharp": "^0.33.4",
-    "heic-decode": "*"
+    "sharp": "^0.33.4"
   },
   "optionalDependencies": {},
   "devDependencies": {
