@@ -14,17 +14,74 @@ export const runtime = 'nodejs';
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 ffmpeg.setFfprobePath(ffprobeInstaller.path);
 
-// Minimal types for ffprobe result to avoid 'any'
+// Minimal types for ffprobe result to avoid 'any' and enable compatibility checks
 type FfprobeStream = {
   codec_type?: string;
   codec_name?: string;
+  profile?: string;
   width?: number;
   height?: number;
   avg_frame_rate?: string; // e.g., "30000/1001"
-  bit_rate?: string;
+  r_frame_rate?: string;
+  pix_fmt?: string;
+  bit_rate?: string; // in bits per second (string)
+  sample_rate?: string; // audio only, e.g., "44100"
+  channels?: number; // audio channels
 };
 type FfprobeFormat = { bit_rate?: string; duration?: string };
 type FfprobeData = { streams?: FfprobeStream[]; format?: FfprobeFormat };
+
+// Helpers
+const parseFps = (rate?: string): number => {
+  if (!rate) return 0;
+  if (rate.includes('/')) {
+    const [n, d] = rate.split('/').map((v) => Number(v || 0));
+    return d ? n / d : n;
+  }
+  const n = Number(rate);
+  return isNaN(n) ? 0 : n;
+};
+
+const approx = (a: number, b: number, tol = 0.75) => Math.abs(a - b) <= tol;
+
+const toKbps = (bitsPerSecond?: string): number => {
+  if (!bitsPerSecond) return 0;
+  const n = parseInt(bitsPerSecond, 10);
+  if (!isFinite(n) || n <= 0) return 0;
+  return Math.floor(n / 1000);
+};
+
+const sanitizeBaseName = (name: string): string => {
+  // only letters and numbers, short and simple
+  const cleaned = (name || 'pixora')
+    .toLowerCase()
+    .replace(/\.[^/.]+$/, '')
+    .replace(/[^a-z0-9]/g, '')
+    .slice(0, 24);
+  if (cleaned.length >= 3) return cleaned;
+  return `pixora${crypto.randomUUID().replace(/[^a-z0-9]/g, '').slice(0, 6)}`;
+};
+
+const isFrameCompatible = (probe: FfprobeData) => {
+  const streams = Array.isArray(probe?.streams) ? probe.streams : [];
+  const v = streams.find((s) => s?.codec_type === 'video');
+  const a = streams.find((s) => s?.codec_type === 'audio');
+  if (!v) return false;
+  const fps = parseFps(v.avg_frame_rate || v.r_frame_rate);
+  const w = v.width || 0;
+  const h = v.height || 0;
+  const totalKbps = toKbps(probe?.format?.bit_rate) || 0;
+  const vOk = v.codec_name === 'h264' && (v.profile || '').toLowerCase().includes('baseline');
+  const sizeOk = w <= 1280 && h <= 720;
+  const fpsOk = approx(fps, 30, 1.0) || approx(fps, 29.97, 1.0);
+  const brOk = totalKbps <= 10_000 || totalKbps === 0; // 0 if unknown
+  const aOk = !a || (
+    a.codec_name === 'mp3' &&
+    (a.sample_rate === '44100' || a.sample_rate === '44100.0') &&
+    (typeof a.channels === 'number' ? a.channels >= 2 : true)
+  );
+  return vOk && sizeOk && fpsOk && aOk && brOk;
+};
 
 export async function POST(req: Request) {
   // Collect stderr to help diagnose failures
@@ -32,8 +89,8 @@ export async function POST(req: Request) {
   let transcodeId = '';
   let inputPath = '';
   let outputPath = '';
-  let usedPath: 'primary' | 'fallback' | 'remux' = 'primary';
-  const targetFps = 24; // fixed fps to aid compression
+  let usedPath: 'primary' | 'fallback' | 'remux' | 'copy' = 'primary';
+  let targetFps = 30; // Frame-ready target (may be overridden by source FPS)
 
   try {
     const formData = await req.formData();
@@ -55,6 +112,13 @@ export async function POST(req: Request) {
 
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
+    // Enforce server-side 200MB limit as well
+    if (buffer.length > 200 * 1024 * 1024) {
+      return NextResponse.json(
+        { error: 'File too large', details: 'Maximum allowed size is 200MB' },
+        { status: 413 }
+      );
+    }
     await fs.writeFile(inputPath, buffer);
 
     // Run ffmpeg to transcode to MP4 (primary: H.264/AAC). If it fails, fallback to MPEG4.
@@ -89,89 +153,117 @@ export async function POST(req: Request) {
     const probe = await new Promise<FfprobeData>((resolve) => {
       ffmpeg.ffprobe(inputPath, (_err, data) => resolve(data as FfprobeData));
     });
-    const hasAudio = Array.isArray(probe?.streams) && probe.streams.some((s) => s?.codec_type === 'audio');
-    const videoStream = Array.isArray(probe?.streams) ? probe.streams.find((s) => s?.codec_type === 'video') : undefined;
-    // fixed fps to aid compression
-    const totalKbps = probe?.format?.bit_rate ? Math.max(1, Math.floor(parseInt(probe.format.bit_rate, 10) / 1000)) : 0;
-    const videoKbps = videoStream?.bit_rate ? Math.max(1, Math.floor(parseInt(videoStream.bit_rate, 10) / 1000)) : 0;
-    const safeSourceKbps = videoKbps || (totalKbps > 0 ? Math.max(300, totalKbps - 128) : 3000);
-    // Aim at ~60% of source video bitrate, with hard clamps
-    let targetVideoKbps = Math.floor(safeSourceKbps * 0.6);
-    targetVideoKbps = Math.max(250, Math.min(1000, targetVideoKbps));
-    // Never exceed source video bitrate (keep at least 50 kbps margin if known)
-    if (videoKbps) {
-      targetVideoKbps = Math.min(targetVideoKbps, Math.max(200, videoKbps - 50));
+    const streams = Array.isArray(probe?.streams) ? probe.streams : [];
+    const hasAudio = streams.some((s) => s?.codec_type === 'audio');
+    const videoStream = streams.find((s) => s?.codec_type === 'video');
+    const audioStream = streams.find((s) => s?.codec_type === 'audio');
+    // Preserve source FPS up to 60, keep a reasonable floor of 24
+    const sourceFpsProbe = parseFps(videoStream?.avg_frame_rate || videoStream?.r_frame_rate);
+    if (sourceFpsProbe && sourceFpsProbe > 0) {
+      const rounded = Math.round(sourceFpsProbe);
+      targetFps = Math.min(60, Math.max(24, rounded));
     }
+    // bitrate estimates
+    const totalKbps = toKbps(probe?.format?.bit_rate) || 0;
+    const videoKbps = toKbps(videoStream?.bit_rate) || 0;
+    const safeSourceKbps = videoKbps || (totalKbps > 0 ? Math.max(300, totalKbps - 128) : 3000);
+    // Initial estimate of target bitrate (adjusted later after scale is chosen)
+    let targetVideoKbps = Math.floor(safeSourceKbps * 0.75);
+    // We'll re-clamp this after deciding scale to aim for significantly better quality.
     // Choose target scale based on source resolution
     const vw = videoStream?.width || 0;
     const vh = videoStream?.height || 0;
-    // Fixed FPS to aid compression
-    const targetFps = 24;
-    let scaleExpr = 'scale=min(640,iw):min(360,ih):force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2';
-    let scaleExprFallback = 'scale=trunc(min(640,iw)/2)*2:trunc(min(360,ih)/2)*2';
-    let scaleTag = '360p';
-    if ((vw >= 1280 || vh >= 720) && (vw < 1920 && vh < 1080)) {
-      scaleExpr = 'scale=min(854,iw):min(480,ih):force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2';
-      scaleExprFallback = 'scale=trunc(min(854,iw)/2)*2:trunc(min(480,ih)/2)*2';
-      scaleTag = '480p';
-    } else if (vw >= 1920 || vh >= 1080) {
-      scaleExpr = 'scale=min(1280,iw):min(720,ih):force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2';
-      scaleExprFallback = 'scale=trunc(min(1280,iw)/2)*2:trunc(min(720,ih)/2)*2';
-      scaleTag = '720p';
-      // For 1080p+ sources, allow up to 1000 kbps
-      targetVideoKbps = Math.min(1000, Math.max(450, targetVideoKbps));
+    const aspect = vw && vh ? vw / vh : 0;
+    const scaleExpr = 'scale=min(1920\\,iw):min(1080\\,ih):force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2';
+    const scaleExprFallback = 'scale=min(1920\\,iw):min(1080\\,ih):force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2';
+    const scaleTag = '<=1080p';
+
+    // Re-clamp bitrate heuristic against a 1080p ceiling (no VBV used in primary path)
+    {
+      const targetW = Math.min(1920, vw || 0);
+      const targetH = Math.min(1080, vh || 0);
+      const norm = targetW && targetH ? (targetW * targetH) / (1920 * 1080) : 0.5;
+      const minKbps = Math.max(3500, Math.round(9000 * norm));
+      const maxKbps = Math.max(6000, Math.round(14000 * norm));
+      targetVideoKbps = Math.max(minKbps, Math.min(maxKbps, Math.floor(safeSourceKbps * 0.9)));
+      if (videoKbps) {
+        targetVideoKbps = Math.min(targetVideoKbps, Math.max(minKbps, videoKbps - 100));
+      }
     }
 
-    // More aggressive compression settings for primary conversion
+    // If already frame-compatible, remux with faststart and skip re-encoding to preserve quality
+    const alreadyCompatible = isFrameCompatible(probe);
+    const remuxCopyOptions: string[] = [
+      '-map', hasAudio ? '0:v:0' : '0:v:0',
+      ...(hasAudio ? ['-map', '0:a:0'] : []),
+      '-c', 'copy',
+      '-movflags', '+faststart',
+      '-f', 'mp4',
+      '-y'
+    ];
+
+    if (alreadyCompatible) {
+      try {
+        await runWithOptions(remuxCopyOptions, 'copy');
+        usedPath = 'copy';
+      } catch (copyErr) {
+        // If copy remux fails, proceed to normal primary encoding path
+        console.error('Copy remux failed, falling back to encode:', copyErr);
+      }
+    }
+    // Build GOP options based on targetFps (approx 2-second GOP)
+    const gopKeyint = Math.max(2, Math.round(targetFps * 2));
+    const gopMinKeyint = Math.max(1, Math.round(targetFps));
+    const x264GopOpts = `keyint=${gopKeyint}:min-keyint=${gopMinKeyint}:scenecut=40:ref=5:bframes=8:b-adapt=2:me=umh:subme=9:trellis=2:aq-mode=2:aq-strength=1.2:rc-lookahead=60:weightp=2:8x8dct=1:direct=auto`;
+
+    // High quality, frame-ready settings for primary conversion (High Profile/AAC/30fps)
     const primaryOptions: string[] = [
       // Video settings
       '-map', '0:v:0',
       '-c:v', 'libx264',
-      '-preset', 'medium',
-      '-tune', 'film',  // Optimize for high quality video
+      '-preset', 'slower',
+      '-tune', 'grain',
       '-pix_fmt', 'yuv420p',
       '-vf', scaleExpr,
       '-r', String(targetFps),
-      // More aggressive CRF (Constant Rate Factor) for better compression
-      // Lower values = better quality but larger file size (18-28 is a good range)
-      '-crf', '23',
-      // Limit maximum bitrate to prevent huge files
-      '-maxrate', `${Math.round(targetVideoKbps * 1.5)}k`,
-      '-bufsize', `${Math.round(targetVideoKbps * 2)}k`,
+      '-profile:v', 'high',
+      '-level', '4.1',
+      // CRF-based compression for quality
+      '-crf', '14',
       // Audio settings
       ...(hasAudio ? [
         '-map', '0:a:0',
         '-c:a', 'aac',
-        '-b:a', '64k',
-        '-ar', '44100',
-        '-ac', '2'  // Force stereo output
+        '-b:a', '320k',
+        '-ar', '48000',
+        '-ac', '2'  // MP3 stereo, 44.1kHz
       ] : ['-an']),  // No audio if not present in source
       // Output settings
       '-movflags', '+faststart',
-      '-profile:v', 'high',
-      '-level', '4.1',
       '-f', 'mp4',
       '-y',
       // Additional optimizations
       '-threads', '0',  // Use all available CPU threads
-      '-x264opts', 'keyint=60:min-keyint=60:scenecut=0'  // Better keyframe control
+      '-x264opts', x264GopOpts  // Dynamic GOP + enhanced motion/psy settings based on target FPS
     ];
 
-    // Last resort - remux with some compression if possible
+    // Last resort - encode with ultrafast Baseline/MP3 to maximize success
     const remuxOptions: string[] = [
-      // Video settings - try to re-encode with very fast settings
+      // Video settings
       '-map', '0:v:0',
       '-c:v', 'libx264',
-      '-preset', 'ultrafast',  // Fastest possible encoding
+      '-preset', 'ultrafast',
       '-pix_fmt', 'yuv420p',
-      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',  // Simple even dimensions
-      '-r', String(Math.min(30, targetFps)),  // Cap at 30fps for this fallback
-      '-crf', '28',  // Higher CRF for smaller files
+      '-vf', scaleExpr,
+      '-r', '30',
+      '-profile:v', 'baseline',
+      '-level', '3.1',
+      '-crf', '23',
       // Audio settings
       ...(hasAudio ? [
         '-map', '0:a:0',
-        '-c:a', 'aac',
-        '-b:a', '64k',
+        '-c:a', 'libmp3lame',
+        '-b:a', '192k',
         '-ar', '44100',
         '-ac', '2'
       ] : ['-an']),
@@ -181,23 +273,28 @@ export async function POST(req: Request) {
       '-y'
     ];
 
-    // Fallback options with stronger compression
+    // Fallback options (quality-biased but faster)
     const fallbackOptions: string[] = [
       // Video settings
       '-map', '0:v:0',
-      '-c:v', 'libx264',  // Still use x264 but with simpler settings
-      '-preset', 'faster',  // Faster encoding than medium
+      '-c:v', 'libx264',
+      '-preset', 'medium',
       '-pix_fmt', 'yuv420p',
       '-vf', scaleExprFallback,
       '-r', String(targetFps),
-      // Use CRF for consistent quality
-      '-crf', '25',  // Slightly higher CRF for smaller files
+      '-profile:v', 'high',
+      '-level', '4.1',
+      // Use CRF for consistent quality (slightly higher quality)
+      '-crf', '17',
+      // Constrain peak bitrate (<= 10 Mbps)
+      '-maxrate', '10M',
+      '-bufsize', '20M',
       // Audio settings
       ...(hasAudio ? [
         '-map', '0:a:0',
         '-c:a', 'aac',
-        '-b:a', '64k',
-        '-ar', '44100',
+        '-b:a', '256k',
+        '-ar', '48000',
         '-ac', '2'
       ] : ['-an']),
       // Output settings
@@ -205,7 +302,8 @@ export async function POST(req: Request) {
       '-f', 'mp4',
       '-y',
       // Optimizations for speed
-      '-threads', '0'
+      '-threads', '0',
+      '-x264opts', x264GopOpts
     ];
 
     const durationSec = probe?.format?.duration ? parseFloat(probe.format.duration) || 0 : 0;
@@ -224,8 +322,10 @@ export async function POST(req: Request) {
             '-vf', scaleExpr,
             '-r', String(targetFps),
             '-b:v', `${targetVideoKbps}k`,
-            '-maxrate', `${Math.round(targetVideoKbps * 1.2)}k`,
-            '-bufsize', `${Math.round(targetVideoKbps * 2)}k`,
+            '-maxrate', `${Math.min(10_000, Math.round(targetVideoKbps * 2))}k`,
+            '-bufsize', `${Math.min(20_000, Math.round(targetVideoKbps * 3))}k`,
+            '-profile:v', 'baseline',
+            '-level', '3.1',
             '-pass', '1',
             '-passlogfile', passLogBase,
             '-an',
@@ -248,12 +348,16 @@ export async function POST(req: Request) {
             '-vf', scaleExpr,
             '-r', String(targetFps),
             '-b:v', `${targetVideoKbps}k`,
-            '-maxrate', `${Math.round(targetVideoKbps * 1.2)}k`,
-            '-bufsize', `${Math.round(targetVideoKbps * 2)}k`,
+            '-maxrate', `${Math.min(10_000, Math.round(targetVideoKbps * 2))}k`,
+            '-bufsize', `${Math.min(20_000, Math.round(targetVideoKbps * 3))}k`,
+            '-profile:v', 'baseline',
+            '-level', '3.1',
             '-pass', '2',
             '-passlogfile', passLogBase,
-            '-c:a', 'aac',
-            '-b:a', '64k',
+            '-c:a', 'libmp3lame',
+            '-b:a', '192k',
+            '-ar', '44100',
+            '-ac', '2',
             '-movflags', '+faststart',
           ])
           .on('stderr', (line) => { stderrLines.push(line); console.log('ffmpeg stderr (p2):', line); })
@@ -264,12 +368,10 @@ export async function POST(req: Request) {
     };
 
     try {
-      if (durationSec >= 10) {
-        await runTwoPassPrimary();
-      } else {
+      if (usedPath !== 'copy') {
         await runWithOptions(primaryOptions);
+        usedPath = 'primary';
       }
-      usedPath = 'primary';
     } catch (primaryErr) {
       console.error('Primary FFmpeg conversion failed:', primaryErr);
       console.error('Error details:', String(primaryErr));
@@ -309,7 +411,8 @@ export async function POST(req: Request) {
     }
 
     const outputBuffer = await fs.readFile(outputPath);
-    const filename = `${baseName}_pixora-ready_${scaleTag}_${targetFps}fps_${targetVideoKbps}k_${usedPath}.mp4`;
+    const safeBase = sanitizeBaseName(baseName);
+    const filename = `${safeBase}fr.mp4`;
 
     const info = `path=${usedPath}; scale=${scaleTag}; fps=${targetFps}; vkbps=${targetVideoKbps}; hasAudio=${hasAudio}`;
     return new NextResponse(outputBuffer as any, {
