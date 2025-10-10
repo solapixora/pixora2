@@ -76,7 +76,6 @@ export const GuideSection: React.FC = () => {
             </motion.div>
           ))}
         </div>
-
         {/* Video Tutorial */}
         <motion.div
           className="max-w-5xl mx-auto"
@@ -93,14 +92,13 @@ export const GuideSection: React.FC = () => {
               شاهد عملية التحويل وتعرّف على نصائح للحصول على أفضل النتائج
             </p>
           </div>
-
           <div className="relative group">
             {/* Video Container */}
             <div className="relative w-full bg-gray-900 rounded-2xl overflow-hidden shadow-2xl">
               <div className="aspect-video">
                 <iframe
                   className="w-full h-full"
-                  src="https://www.youtube.com/embed/dQw4w9WgXcQ"
+                  src="https://www.youtube.com/embed/kqHTN8g-7LQ"
                   title="دليل محول PIXORA"
                   frameBorder="0"
                   allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
@@ -108,8 +106,6 @@ export const GuideSection: React.FC = () => {
                 />
               </div>
             </div>
-
-            {/* Video Overlay */}
             <div className="absolute inset-0 bg-gradient-to-t from-black/20 to-transparent rounded-2xl pointer-events-none" />
           </div>
         </motion.div>
